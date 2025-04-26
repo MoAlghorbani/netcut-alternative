@@ -1,5 +1,7 @@
 import sys
 import logging
+import time # Added for sleep
+import msvcrt # Added for non-blocking input on Windows
 
 # Configure logging to suppress Scapy's verbose output
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
@@ -121,14 +123,43 @@ if __name__ == "__main__":
         sys.exit(1) # Exit if no interface selected
 
     target_range = get_local_ip_range()
-    if target_range:
-        discovered_hosts = arp_scan(target_range, selected_interface_name)
-        print_results(discovered_hosts)
-    else:
+    if not target_range:
         # Example of manual input if auto-detection fails
         manual_range = input("[*] Enter the target IP range (e.g., 192.168.1.0/24): ")
         if manual_range:
-             discovered_hosts = arp_scan(manual_range, selected_interface_name)
-             print_results(discovered_hosts)
+            target_range = manual_range
         else:
             print("[!] No target range specified. Exiting.")
+            sys.exit(1)
+
+    print("\n[*] Initial scan...")
+    discovered_hosts = arp_scan(target_range, selected_interface_name)
+    print_results(discovered_hosts)
+
+    print("\n[*] Scanner running. Press 'r' to refresh, 'q' to quit.")
+
+    try:
+        while True:
+            if msvcrt.kbhit(): # Check if a key has been pressed
+                key = msvcrt.getch().decode('utf-8').lower()
+                if key == 'r':
+                    print("\n[*] Refreshing host list...")
+                    # Optional: Clear screen (might need os.system('cls') on Windows)
+                    # import os
+                    # os.system('cls')
+                    discovered_hosts = arp_scan(target_range, selected_interface_name)
+                    print_results(discovered_hosts)
+                    print("\n[*] Scanner running. Press 'r' to refresh, 'q' to quit.")
+                elif key == 'q':
+                    print("\n[*] Exiting scanner.")
+                    break # Exit the loop
+
+            time.sleep(0.1) # Prevent high CPU usage
+
+    except KeyboardInterrupt:
+        print("\n[!] Scan aborted by user (Ctrl+C).")
+    except Exception as e:
+        print(f"\n[!] An unexpected error occurred: {e}")
+    finally:
+        print("[*] Scanner stopped.")
+        sys.exit(0)
