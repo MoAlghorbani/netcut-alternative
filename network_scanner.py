@@ -5,7 +5,7 @@ import msvcrt
 import threading # Added for background sniffing
 import socket # Moved import here
 import os # Added for screen clearing
-from collections import defaultdict # Added for tracking usage
+from collections import defaultdict, deque # Added deque for limited history
 from colorama import Fore, Style, init
 
 # Initialize colorama
@@ -17,16 +17,18 @@ logging.getLogger("scapy.interactive").setLevel(logging.ERROR)
 logging.getLogger("scapy.loading").setLevel(logging.ERROR)
 
 try:
-    from scapy.all import ARP, Ether, srp, get_if_list, conf, sniff, IP # Added sniff, IP
+    from scapy.all import ARP, Ether, srp, get_if_list, conf, sniff, IP, UDP, DNS, DNSQR # Added UDP, DNS, DNSQR
 except ImportError:
     print("Scapy library is not installed. Please install it using: pip install scapy")
     sys.exit(1)
 
-# --- Globals for Bandwidth Monitoring ---
+# --- Globals --- 
 bandwidth_lock = threading.Lock()
 # Stores {ip: bytes}
 upload_usage = defaultdict(int)
 download_usage = defaultdict(int)
+# Stores {ip: deque([domain1, domain2, ...])}
+dns_queries = defaultdict(lambda: deque(maxlen=10)) # Store last 10 unique queries per IP
 # Keep track of known local IPs from the last scan
 known_ips = set()
 stop_sniffing_event = threading.Event()
@@ -44,34 +46,61 @@ def format_bytes(size):
 
 def packet_callback(packet):
     """Callback function for processing sniffed packets."""
-    global upload_usage, download_usage, known_ips
+    global upload_usage, download_usage, known_ips, dns_queries
+
+    # --- Bandwidth Calculation --- 
     if IP in packet:
         src_ip = packet[IP].src
         dst_ip = packet[IP].dst
-        # Ensure packet has length attribute (some packets might not)
         packet_size = len(packet) if hasattr(packet, '__len__') else 0
-        if packet_size == 0:
-            return # Ignore packets with no size
 
-        with bandwidth_lock:
-            # Check if source is a known local IP (Sent)
-            if src_ip in known_ips:
-                upload_usage[src_ip] += packet_size
-            # Check if destination is a known local IP (Received)
-            # Use 'if' instead of 'elif' to count packets destined for local IPs even if source is also local
-            if dst_ip in known_ips:
-                download_usage[dst_ip] += packet_size
+        if packet_size > 0:
+            with bandwidth_lock:
+                if src_ip in known_ips:
+                    upload_usage[src_ip] += packet_size
+                if dst_ip in known_ips:
+                    download_usage[dst_ip] += packet_size
+
+    # --- DNS Query Capture --- 
+    # Check for DNS query (UDP, port 53, DNS layer with a query record)
+    if packet.haslayer(DNS) and packet.haslayer(DNSQR) and packet.haslayer(UDP) and packet[UDP].dport == 53:
+        # qr=0 indicates a query
+        if packet[DNS].qr == 0 and IP in packet: 
+            src_ip = packet[IP].src
+            # Ensure qname exists and is bytes before decoding
+            if hasattr(packet[DNSQR], 'qname') and isinstance(packet[DNSQR].qname, bytes):
+                try:
+                    queried_domain = packet[DNSQR].qname.decode('utf-8', errors='ignore') # Decode safely
+                    # Only track queries originating from known local IPs
+                    if src_ip in known_ips:
+                        with bandwidth_lock: # Protect access to shared dns_queries
+                            # Add to deque only if not already the most recent entry
+                            if not dns_queries[src_ip] or dns_queries[src_ip][-1] != queried_domain:
+                                dns_queries[src_ip].append(queried_domain)
+                except Exception as e:
+                    # Log potential decoding or other errors quietly
+                    # print(f"Error processing DNS query: {e}") # Optional: for debugging
+                    pass
+
 
 def start_sniffing(interface):
     """Starts the packet sniffer in a separate thread."""
-    print(f"{Style.BRIGHT}{Fore.GREEN}[*]{Style.RESET_ALL} Starting bandwidth monitor...{Style.RESET_ALL}")
+    print(f"{Style.BRIGHT}{Fore.GREEN}[*]{Style.RESET_ALL} Starting packet sniffer (Bandwidth & DNS)...{Style.RESET_ALL}")
     try:
-        # Use stop_filter on the sniff function to allow graceful stopping
-        sniff(iface=interface, prn=packet_callback, store=0, stop_filter=lambda p: stop_sniffing_event.is_set())
+        # Filter for IP traffic for bandwidth and UDP port 53 for DNS
+        # Note: This BPF filter might slightly impact performance vs. no filter,
+        # but significantly reduces packets processed by the callback.
+        # It captures all IP for bandwidth, and specifically UDP 53 for DNS check.
+        # We still need the python check `if packet.haslayer(DNS)` etc.
+        # because other UDP 53 traffic might exist.
+        bpf_filter = "ip or (udp port 53)" 
+        sniff(iface=interface, prn=packet_callback, store=0, 
+              stop_filter=lambda p: stop_sniffing_event.is_set(),
+              filter=bpf_filter)
     except OSError as e:
          # Handle potential "Network is down" or interface issues gracefully
          print(f"\n{Style.BRIGHT}{Fore.RED}[!]{Style.RESET_ALL} Error starting sniffer on interface {interface}: {e}")
-         print(f"{Style.BRIGHT}{Fore.YELLOW}[*]{Style.RESET_ALL} Bandwidth monitoring failed to start.")
+         print(f"{Style.BRIGHT}{Fore.YELLOW}[*]{Style.RESET_ALL} Packet sniffing failed to start.")
          # Signal main thread if necessary, or just let the thread exit
          stop_sniffing_event.set() # Ensure main loop knows sniffer isn't running
     except Exception as e:
@@ -80,7 +109,7 @@ def start_sniffing(interface):
     finally:
         # This print might be confusing if sniffer failed to start
         if not stop_sniffing_event.is_set(): # Only print if stopped normally
-             print(f"{Style.BRIGHT}{Fore.YELLOW}[*]{Style.RESET_ALL} Bandwidth monitor stopped.{Style.RESET_ALL}")
+             print(f"{Style.BRIGHT}{Fore.YELLOW}[*]{Style.RESET_ALL} Packet sniffer stopped.{Style.RESET_ALL}")
 
 
 def get_local_ip_range():
@@ -221,39 +250,43 @@ def arp_scan(ip_range, interface):
         # traceback.print_exc()
         return [] # Return empty list on other errors
 
+
 def print_results(clients_list):
-    """Prints the discovered IP, MAC, and bandwidth usage."""
+    """Prints the discovered IP, MAC, bandwidth usage, and recent DNS queries."""
     if not clients_list:
-        # Don't print "No active hosts" if the list is just empty after a scan
-        # print(f"{Style.BRIGHT}{Fore.YELLOW}[!]{Style.RESET_ALL} No active hosts found on the network.")
         return
 
     print(f"\n{Style.BRIGHT}{Fore.GREEN}[*]{Style.RESET_ALL} Active hosts found:")
-    # Changed to Sent/Received columns - Adjust spacing as needed
-    header = f"{'IP Address':<15}\t{'MAC Address':<17}\t{'Sent':>10}\t{'Received':>10}"
+    # Added DNS Queries column
+    header = f"{'IP Address':<15}\t{'MAC Address':<17}\t{'Sent':>10}\t{'Received':>10}\t{'Recent DNS Queries'}"
     print(f"{Style.BRIGHT}{Fore.WHITE}{header}{Style.RESET_ALL}")
     print(f"{Style.BRIGHT}{Fore.WHITE}{'-' * (len(header) + 5)}{Style.RESET_ALL}") # Adjust separator length
 
     with bandwidth_lock:
-        # Sort by IP address for consistent display
-        # Use a try-except block for inet_aton in case of invalid IPs (though unlikely from Scapy)
         def ip_sort_key(client):
             try:
                 return socket.inet_aton(client['ip'])
             except socket.error:
-                return b'\x00\x00\x00\x00' # Default sort value for invalid IPs
+                return b'\x00\x00\x00\x00'
 
         sorted_clients = sorted(clients_list, key=ip_sort_key)
 
         for client in sorted_clients:
             ip = client['ip']
             mac = client['mac']
-            # Get usage, default to 0 if IP not seen by sniffer yet
             sent_bytes = upload_usage.get(ip, 0)
             received_bytes = download_usage.get(ip, 0)
             sent = format_bytes(sent_bytes)
             received = format_bytes(received_bytes)
-            print(f"{Fore.CYAN}{ip:<15}{Style.RESET_ALL}\t{Fore.MAGENTA}{mac:<17}{Style.RESET_ALL}\t{Fore.YELLOW}{sent:>10}{Style.RESET_ALL}\t{Fore.GREEN}{received:>10}{Style.RESET_ALL}")
+            
+            # Get recent DNS queries for this IP
+            recent_queries = list(dns_queries.get(ip, [])) # Get list from deque
+            # Display last 3 queries, comma-separated
+            queries_str = ", ".join(recent_queries[-3:]) if recent_queries else "-"
+
+            # Print with DNS queries
+            print(f"{Fore.CYAN}{ip:<15}{Style.RESET_ALL}\t{Fore.MAGENTA}{mac:<17}{Style.RESET_ALL}\t{Fore.YELLOW}{sent:>10}{Style.RESET_ALL}\t{Fore.GREEN}{received:>10}{Style.RESET_ALL}\t{Fore.LIGHTBLUE_EX}{queries_str}{Style.RESET_ALL}")
+            
     print(f"{Style.BRIGHT}{Fore.WHITE}{'-' * (len(header) + 5)}{Style.RESET_ALL}") # Adjust separator length
 
 if __name__ == "__main__":
@@ -337,10 +370,10 @@ if __name__ == "__main__":
 
             # Check if sniffer thread died unexpectedly
             if sniffer_alive and not sniffer_thread.is_alive():
-                print(f"\n{Style.BRIGHT}{Fore.RED}[!]{Style.RESET_ALL} Bandwidth monitor thread stopped unexpectedly.")
+                print(f"\n{Style.BRIGHT}{Fore.RED}[!]{Style.RESET_ALL} Packet sniffer thread stopped unexpectedly.")
                 sniffer_alive = False
                 # Decide whether to try restarting or just inform the user
-                print(f"{Style.BRIGHT}{Fore.YELLOW}[i]{Style.RESET_ALL} Bandwidth usage will not be updated.")
+                print(f"{Style.BRIGHT}{Fore.YELLOW}[i]{Style.RESET_ALL} Bandwidth and DNS data will not be updated.")
                 # Prevent continuous printing of this message
                 last_refresh_time = current_time # Reset timer to avoid immediate auto-refresh
 
